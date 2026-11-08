@@ -9,20 +9,17 @@
  * 文件描述符上限由外部 shell 的 ulimit 负责，程序内不再调整 RLIMIT_NOFILE：
  * macOS 默认 soft limit 只有 256，且超过 kern.maxfilesperproc 会失败，用 `ulimit -n 10240` 自行抬高。
  *
- * 结构：① 参数 ② 帧编解码 ③ 扩展通道 ④ CA ⑤ mockttp 接线 ⑥ 退出。
+ * 结构：① 参数 ② 帧编解码 ③ 扩展通道 ④ CA 证书 ⑤ 接线 ⑥ 退出。
  * 通道只吃 mockttp.CompletedRequest、只吐 mockttp 的回调结果，两边靠类型对接，互不依赖内部实现。
  * 头全程用 mockttp 的 RawHeaders（[[name, value], ...]）：不经 Headers 归一化，大小写、重复、顺序原样保留。
  */
 import * as mockttp from "mockttp@4.6.5";
+import { findRawHeader, rawHeadersToObject } from "mockttp@4.6.5/dist/util/header-utils";
 import { isLocalhostAddress } from "mockttp@4.6.5/dist/util/ip-utils";
-import {
-    findRawHeader,
-    rawHeadersToObject,
-} from "mockttp@4.6.5/dist/util/header-utils";
-import { join } from "node:path";
-import { homedir } from "node:os";
-import { parseArgs } from "node:util";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { parseArgs } from "node:util";
 import type { ServerWebSocket } from "bun";
 
 // ================================================================ ① 参数
@@ -41,7 +38,6 @@ const { values: opt } = parseArgs({
         // 代价：这些域名的流量不经过 Chrome，要求本机对这些域名有直接出网能力。
         passthrough: { type: "string", default: "" },
     },
-    strict: true,
 });
 
 function die(msg: string): never {
@@ -55,7 +51,7 @@ function toPort(s: string, name: string): number {
     return n;
 }
 
-const PORT = toPort(opt.port!, "--port");
+const PORT = toPort(opt.port, "--port");
 
 // --ws 只接受 host:port；URL.parse 对缺主机名、非数字端口、越界端口一律返回 null
 const wsUrl = URL.parse(`ws://${opt.ws}`);
@@ -64,7 +60,7 @@ const WS_HOST = wsUrl.hostname.replace(/^\[|\]$/g, ""); // Bun.serve 不接受�
 const WS_PORT = toPort(wsUrl.port, "--ws");
 
 const TIMEOUT_MS = 60_000;
-const CA_DIR = opt["ca-dir"]!;
+const CA_DIR = opt["ca-dir"];
 // 超过这个大小只告警，不拒绝：响应必须整块攒齐才能 resolve，越大越可能把内存吃满
 const MAX_MB = 500;
 const MAX = MAX_MB * 1024 * 1024;
@@ -73,8 +69,8 @@ const MAX = MAX_MB * 1024 * 1024;
 const MAX_FRAME = 2 ** 31 - 1;
 
 // 透传域名：一条 --passthrough 里用逗号分隔，省得命令行写一长串
-const PASSTHROUGH = opt
-    .passthrough!.split(",")
+const PASSTHROUGH = opt.passthrough
+    .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
 
@@ -93,27 +89,22 @@ const PASSTHROUGH = opt
 /** bridge -> 扩展 */
 type ToExt =
     | {
-        t: "req";
-        id: string;
-        method: string;
-        url: string;
-        headers: [string, string][];
-    }
+          t: "req";
+          id: string;
+          method: string;
+          url: string;
+          headers: [string, string][];
+      }
     | { t: "cancel"; id: string };
 
 /** 扩展 -> bridge。扩展是可信对端，unpack 只保证 JSON 可解析，字段形状由协议保证。 */
 type FromExt =
     | { t: "data"; id: string } // 正文在帧体里
-    | {
-        t: "end";
-        id: string;
-        status: number;
-        headers: [string, string][];
-        msg?: string;
-    }; // 带 msg = 扩展侧失败
+    | { t: "end"; id: string; status: number; headers: [string, string][] }
+    | { t: "end"; id: string; msg: string }; // 扩展侧失败，文案由扩展拼好
 
 function pack(head: ToExt, body?: Uint8Array): Buffer {
-    const h = Buffer.from(JSON.stringify(head) + "\n");
+    const h = Buffer.from(`${JSON.stringify(head)}\n`);
     return body?.length ? Buffer.concat([h, body]) : h;
 }
 
@@ -142,7 +133,6 @@ interface Pending {
     url: string;
     chunks: Buffer[];
     size: number;
-    warned: boolean; // 超过 MAX_MB 只告警一次，别每帧刷屏
     seen: number; // 最后一帧的时间戳，超时扫描用
     resolve: (r: Reply) => void;
 }
@@ -156,10 +146,7 @@ const pending = new Map<string, Pending>();
 const HOP = "x-bridge-hop";
 
 function textReply(statusCode: number, message: string): Reply {
-    // 显式给 content-length：mockttp 的 callback 路径只要返回了 headers 就会调 dropDefaultHeaders()，
-    // 把 content-length / transfer-encoding 一起删掉（见 complete() 的注释）。缺了 framing 头，
-    // body 只能靠关闭连接界定，而 EOF 定界本身不可靠：hyper/rustls 要求先收到 TLS close_notify
-    // 才认 EOF，否则报 "peer closed connection without sending TLS close_notify"（pixi、uv、pip 全中招）。
+    // 必须显式给 content-length，原因见 complete()：少了 framing 头只能靠 EOF 定界，Rust 客户端会报错
     const rawBody = Buffer.from(`chrome-bridge: ${message}\n`);
     return {
         statusCode,
@@ -192,9 +179,7 @@ function finish(p: Pending, r: Reply) {
 }
 
 function warnLarge(what: string, size: number, url: string) {
-    console.warn(
-        `[size]  ${what} ${(size / 1024 / 1024).toFixed(1)} MB 超过 ${MAX_MB} MB：${url}`,
-    );
+    console.warn(`[size]  ${what} ${(size / 1024 / 1024).toFixed(1)} MB 超过 ${MAX_MB} MB：${url}`);
 }
 
 /** 失败：先让扩展中止对应的 fetch，再给客户端一个错误响应。已结束的请求直接跳过。 */
@@ -215,8 +200,7 @@ function failAll(why: string, code: number) {
 setInterval(() => {
     const now = Date.now();
     for (const p of pending.values())
-        if (now - p.seen > TIMEOUT_MS)
-            fail(p.id, `扩展响应超时（${TIMEOUT_MS / 1000}s）`, 504);
+        if (now - p.seen > TIMEOUT_MS) fail(p.id, `扩展响应超时（${TIMEOUT_MS / 1000}s）`, 504);
 }, 1000);
 
 // 只对代理这一跳有意义的头；其余禁止设置的头由浏览器的 fetch 自动忽略。
@@ -265,27 +249,23 @@ function complete(p: Pending, status: number, pairs: [string, string][]) {
     });
 
     // content-length 必须显式写回：callback 返回了 headers 时 mockttp 会调 dropDefaultHeaders()，
-    // 把 content-length / transfer-encoding 一起删掉（mockttp 4.6.5 的 writeResponseFromCallback，
-    // 上游 issue 见 issues/01）。两个 framing 头都没了，Node 只能置 Connection: close 并用 EOF 定界。
+    // 把 content-length / transfer-encoding 一起删掉（mockttp 4.6.5 的 writeResponseFromCallback）。
+    // 两个 framing 头都没了，Node 只能置 Connection: close 并用 EOF 定界。
     // EOF 定界本身不可靠：hyper/rustls 要求先收到 TLS close_notify 才认 EOF，否则报
     // "peer closed connection without sending TLS close_notify"（pixi、uv、pip 全部中招）。
     // curl 按 RFC 7230 §3.3.3 用 EOF 兜底，所以只有 Rust 客户端会失败。
     // 无 body 的状态码不补；HEAD 用上游声明的值（非数字会让 writeHead 抛错，故先校验），其余按实际字节数。
     if (!NO_BODY_STATUS.has(status)) {
-        const declared = findRawHeader(pairs, "content-length")?.[1];
+        const declared =
+            p.method === "HEAD" ? findRawHeader(pairs, "content-length")?.[1] : undefined;
         out.push([
             "content-length",
-            p.method === "HEAD" && declared && /^\d+$/.test(declared)
-                ? declared
-                : String(p.size),
+            declared && /^\d+$/.test(declared) ? declared : String(p.size),
         ]);
     }
 
     // 单块（绝大多数响应）直接复用，省掉一次整块拷贝；多块才 concat，带上总长度省掉它自己再遍历一遍
-    const rawBody =
-        p.chunks.length === 1 ? p.chunks[0] : Buffer.concat(p.chunks, p.size);
-    // concat 之后原始帧没用了：不清空的话它们会和 rawBody 一起活到 p 被回收，峰值翻倍
-    p.chunks = [];
+    const rawBody = p.chunks.length === 1 ? p.chunks[0] : Buffer.concat(p.chunks, p.size);
 
     finish(p, {
         statusCode: status,
@@ -299,34 +279,27 @@ function onFrame(head: FromExt, body: Buffer) {
     if (!p) return; // 已结束或已取消的请求
 
     if (head.t === "end") {
-        // 扩展侧失败时自己拼好文案：只有它知道上游状态码和已发字节数
-        return head.msg === undefined
-            ? complete(p, head.status, head.headers)
-            : finish(p, textReply(502, head.msg));
+        return "msg" in head
+            ? finish(p, textReply(502, head.msg))
+            : complete(p, head.status, head.headers);
     }
 
     p.size += body.length;
-    if (!p.warned && p.size > MAX) {
-        p.warned = true;
-        warnLarge("响应体", p.size, p.url);
-    }
+    if (p.size > MAX && p.size - body.length <= MAX) warnLarge("响应体", p.size, p.url);
     // 实测 Bun 不复用消息缓冲（每条消息独立 ArrayBuffer），可直接持有视图，省掉一次整块 memcpy
     p.chunks.push(body);
     p.seen = Date.now();
 }
 
 /** 把请求交给扩展，等它把响应流回来。id 直接用 mockttp 分配的 req.id。 */
-async function viaChrome(req: mockttp.CompletedRequest): Promise<Reply> {
+function viaChrome(req: mockttp.CompletedRequest): mockttp.MaybePromise<Reply> {
     // 扩展发出的 fetch 又回到了这里：Chrome 或系统代理指向了 bridge 本身
     if (findRawHeader(req.rawHeaders, HOP)) {
-        console.error(
-            `[loop]  ${req.method} ${req.url}：Chrome 的代理指向了 bridge 本身`,
-        );
+        console.error(`[loop]  ${req.method} ${req.url}：Chrome 的代理指向了 bridge 本身`);
         return textReply(508, "检测到回环：Chrome 的代理指向了 bridge 本身");
     }
 
-    if (current?.readyState !== WebSocket.OPEN)
-        return textReply(502, "Chrome 扩展未连接");
+    if (current?.readyState !== WebSocket.OPEN) return textReply(502, "Chrome 扩展未连接");
 
     const body = req.body.buffer;
     if (body.byteLength > MAX) warnLarge("请求体", body.byteLength, req.url);
@@ -338,7 +311,6 @@ async function viaChrome(req: mockttp.CompletedRequest): Promise<Reply> {
             url: req.url,
             chunks: [],
             size: 0,
-            warned: false,
             seen: Date.now(),
             resolve,
         };
@@ -431,9 +403,8 @@ const server = mockttp.getLocal({
         // 这是 pinning 应用（WhatsApp 等）和 Apple 系统服务的唯一可行路径。
         // 注意：透传由 Bun 进程直接连上游，要求本机对这些域名有直连出网能力；
         // 若本机只靠 Chrome 出网，透传会 ECONNREFUSED，反而不如不解密。
-        ...(PASSTHROUGH.length
-            ? { tlsPassthrough: PASSTHROUGH.map((hostname) => ({ hostname })) }
-            : {}),
+        // 空数组与不传等价（mockttp 内部 `list?.map(...) ?? []`），所以不必按长度分支。
+        tlsPassthrough: PASSTHROUGH.map((hostname) => ({ hostname })),
     },
     socks: true,
     passthrough: ["unknown-protocol"], // 通过 SOCKS 进来的非 HTTP 流量（如 ssh）直接转发
@@ -470,22 +441,20 @@ await server.on("abort", (req) => fail(req.id, "客户端已断开", 499));
  * BAD_PACKET_LENGTH，情况更糟。因此 cert-rejected 在 Bun 下基本不会出现，真正的信任问题
  * 会落到 unknown，并在上一行留下 mockttp 打的 "Unknown TLS error"。
  */
-const TLS_CAUSE: Partial<
-    Record<mockttp.TlsHandshakeFailure["failureCause"], string>
-> = {
+// 全量 Record：failureCause 只有这 6 个值，漏写会编译报错，日志里也就不需要兜底分支
+const TLS_CAUSE: Record<mockttp.TlsHandshakeFailure["failureCause"], string> = {
     "cert-rejected": "客户端不信任 CA（回了 alert）",
     reset: "客户端静默 RST，未回 alert：多为证书 pinning 或非 HTTP 协议，装 CA 无效",
     closed: "客户端未回 alert 就关闭连接：多为 pinning，或只是探测/预连接",
     "no-shared-cipher": "密码套件协商失败，与证书无关",
     "handshake-timeout": "客户端未发 ClientHello，握手超时",
     // Bun 的 alert 文案与 mockttp 的正则对不上（TLS 1.3 还加密），「客户端拒绝证书」也落在这里
-    unknown:
-        "原因未识别：若上一行是 alert 或 BAD_PACKET_LENGTH，通常是客户端拒绝了证书",
+    unknown: "原因未识别：若上一行是 alert 或 BAD_PACKET_LENGTH，通常是客户端拒绝了证书",
 };
 
-await server.on("tls-client-error", (e: mockttp.TlsHandshakeFailure) => {
+await server.on("tls-client-error", (e) => {
     console.warn(
-        `[tls]   ${e.tlsMetadata?.sniHostname ?? "-"} 握手失败（${e.failureCause}，来自 :${e.remotePort ?? "?"}）：${TLS_CAUSE[e.failureCause] ?? "原因未识别"}`,
+        `[tls]   ${e.tlsMetadata?.sniHostname ?? "-"} 握手失败（${e.failureCause}，来自 :${e.remotePort ?? "?"}）：${TLS_CAUSE[e.failureCause]}`,
     );
 });
 
@@ -504,7 +473,7 @@ async function shutdown() {
     if (stopping) return;
     stopping = true;
     failAll("bridge 正在关闭", 503);
-    await server.stop().catch(() => { });
+    await server.stop().catch(() => {});
     wsServer.stop(true);
     process.exit(0);
 }

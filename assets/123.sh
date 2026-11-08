@@ -19,6 +19,12 @@ set -xU BUNDLE_SSL_CA_CERT "$BUNDLE"
 curl -fsSL https://curl.se/ca/cacert.pem -o "$BUNDLE"
 cat "$CA_PEM" >> "$BUNDLE"
 
-     security find-certificate -c "Chrome Bridge CA" /Library/Keychains/System.keychain
+MacOS:
 sudo security add-trusted-cert -d -r trustRoot -p ssl -k /Library/Keychains/System.keychain "$CA_PEM"
 sudo security remove-trusted-cert -d "$CA_PEM"
+     security find-certificate -c "Chrome Bridge CA" /Library/Keychains/System.keychain
+
+Linux:
+limactl shell backup -- sudo cp /Users/leo/.chrome-bridge-ca/ca.pem /etc/pki/ca-trust/source/anchors/chrome-bridge-ca.pem
+limactl shell backup -- sudo update-ca-trust extract
+limactl shell backup -- trust list | grep 'Chrome Bridge CA'

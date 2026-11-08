@@ -52,7 +52,7 @@ ulimit -n 10240 && bun mitmproxy.ts \
 | bridge → 扩展 | `req` | `id` / `method` / `url` / `headers` + 正文 |
 | bridge → 扩展 | `cancel` | `id` |
 | 扩展 → bridge | `data` | `id` + 正文 |
-| 扩展 → bridge | `end` | `id` / `status` / `headers`，带 `msg` 表示扩展侧失败 |
+| 扩展 → bridge | `end` | 二选一：`id` / `status` / `headers`，或 `id` / `msg`（扩展侧失败） |
 
 没有 `head` 帧：bridge 必须攒齐整个 body 才能 resolve，status / headers 提前到达也用不上，统一由 `end` 帧携带，省掉一套「头到了没到」的状态与分支。
 
@@ -118,7 +118,7 @@ sequenceDiagram
 
     E->>E: onmessage → 切头/正文 → 按 head.t 分派 handle() 或 abort()
     E->>E: inflight.set(id, AbortController)<br/>hasBody = body 非空 且 method 不是 GET / HEAD
-    E->>E: buildHeaders：new Headers(过滤掉 user-agent 的 pairs)<br/>用 Chrome 自己的 UA；禁止头（Cookie / Host / Origin / Sec-*）由 fetch 忽略<br/>强制 set x-bridge-hop 1
+    E->>E: new Headers(req.headers)，强制 set x-bridge-hop 1<br/>禁止头（Cookie / Host / Origin / Sec-*）由 fetch 忽略<br/>UA 用 Chrome 自己的
     Note over E: 客户端传来的 Cookie 头被 fetch 当禁止头丢弃<br/>真正的 cookie 全部来自 credentials include + Chrome 的 cookie jar
     E->>U: fetch(url, method, headers, body, credentials include, cache no-store, signal)
     Note over E,U: redirect 未设置 → 默认 follow，重定向在 Chrome 内部完成<br/>GET / HEAD 命中 resp.redirected 时，把终点 URL 还原成一次 302 交还客户端<br/>其余方法 Chrome 已重发过 body，只能直接给终点响应<br/>中间跳的 Set-Cookie 仍然丢失

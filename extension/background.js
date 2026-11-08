@@ -11,7 +11,7 @@ const dec = new TextDecoder();
 
 // WebSocket 消息本身已是边界，头与正文只靠第一个 \n 分隔（JSON.stringify 不产生裸换行）
 function pack(head, body) {
-    const h = enc.encode(JSON.stringify(head) + "\n");
+    const h = enc.encode(`${JSON.stringify(head)}\n`);
     if (!body?.length) return h;
     const out = new Uint8Array(h.length + body.length);
     out.set(h);
@@ -36,7 +36,7 @@ const inflight = new Map(); // 请求 id -> AbortController
 function onMessage(sock, data) {
     const bytes = new Uint8Array(data);
     const i = bytes.indexOf(10);
-    if (i < 0) return; // 半截消息，丢弃
+    if (i < 0) return; // 畸形帧（无分隔符），丢弃
     const head = JSON.parse(dec.decode(bytes.subarray(0, i)));
     if (head.t === "req") handle(sock, head, bytes.subarray(i + 1));
     else if (head.t === "cancel") inflight.get(head.id)?.abort();
@@ -44,11 +44,13 @@ function onMessage(sock, data) {
 
 /** 等发送缓冲降下来；连接断了就别再等，直接抛错让上层放弃这次响应 */
 async function drain(sock) {
-    // 轮询而不是用 bufferedamountlow 事件：socket 卡住（对端不读）时事件永远不会来，轮询至少能靠 close 退出
+    // 轮询而不是用 bufferedamountlow 事件：socket 卡住（对端不读）时事件永远不会来，
+    // 轮询至少能靠 close 退出
     while (sock.readyState === WebSocket.OPEN && sock.bufferedAmount > MAX_BUFFERED) {
         await new Promise((r) => setTimeout(r, 10));
     }
-    if (sock.readyState !== WebSocket.OPEN) throw new Error("bridge disconnected"); // 别把剩下的几百 MB 白读一遍
+    // 别把剩下的几百 MB 白读一遍
+    if (sock.readyState !== WebSocket.OPEN) throw new Error("bridge disconnected");
 }
 
 function connect() {
@@ -67,7 +69,9 @@ function connect() {
     sock.onclose = (e) => {
         // 旧连接的 onclose 会晚于新连接建立触发；此时既不能清 inflight，也不该重连
         if (ws !== sock) return;
-        console.warn(`[bridge] closed code=${e.code} reason=${e.reason || "-"}, retry in ${backoff}ms`);
+        console.warn(
+            `[bridge] closed code=${e.code} reason=${e.reason || "-"}, retry in ${backoff}ms`,
+        );
         ws = null;
         for (const ac of inflight.values()) ac.abort();
         inflight.clear();
@@ -90,33 +94,49 @@ connect();
 
 // ================================================================ ③ 请求处理
 
-function buildHeaders(raw) {
-    // 用 Chrome 自己的 UA；禁止设置的头（Cookie、Host、Origin、Sec-* 等）fetch 会自动忽略
-    const headers = new Headers(raw.filter(([k]) => k.toLowerCase() !== "user-agent"));
-    headers.set("x-bridge-hop", "1"); // 回环检测标记
-    return headers;
-}
-
-function fmtCookie(c) {
-    return [
-        `${c.name}=${c.value}`,
-        !c.hostOnly && `Domain=${c.domain}`, // host-only cookie 不能带 Domain，否则会被当成域 cookie
-        `Path=${c.path}`,
-        c.secure && "Secure",
-        c.httpOnly && "HttpOnly",
-        c.expirationDate && `Expires=${new Date(c.expirationDate * 1000).toUTCString()}`,
-    ]
-        .filter(Boolean)
-        .join("; ");
+// Cookie 是 fetch 的 forbidden header，只能写进 Chrome 的 jar 再靠 credentials:"include" 带出去。
+// 不还原：污染用户会话是可接受的代价。
+// shortcut: jar 会被客户端 cookie 覆盖，要隔离得用独立 profile 或 partitionKey。
+async function applyCookies(url, raw) {
+    const secure = url.startsWith("https:");
+    for (const [k, v] of raw) {
+        if (k.toLowerCase() !== "cookie") continue;
+        for (const part of v.split(";")) {
+            const s = part.trim();
+            const i = s.indexOf("=");
+            if (i > 0)
+                await chrome.cookies
+                    .set({
+                        url,
+                        name: s.slice(0, i).trim(),
+                        value: s.slice(i + 1).trim(),
+                        path: "/",
+                        secure,
+                    })
+                    .catch(() => {});
+        }
+    }
 }
 
 // fetch 的 credentials 只进 Chrome 的 cookie jar，代理客户端拿不到；
 // 把目标站的 cookie 回传成 Set-Cookie，客户端（如 curl -c）才能保存会话
 async function cookieHeaders(url) {
     try {
-        return (await chrome.cookies.getAll({ url })).map((c) => ["set-cookie", fmtCookie(c)]);
+        return (await chrome.cookies.getAll({ url })).map((c) => [
+            "set-cookie",
+            [
+                `${c.name}=${c.value}`,
+                !c.hostOnly && `Domain=${c.domain}`, // host-only cookie 不能带 Domain，否则会被当成域 cookie
+                `Path=${c.path}`,
+                c.secure && "Secure",
+                c.httpOnly && "HttpOnly",
+                c.expirationDate && `Expires=${new Date(c.expirationDate * 1000).toUTCString()}`,
+            ]
+                .filter(Boolean)
+                .join("; "),
+        ]);
     } catch {
-        return []; // data:/blob: 等非 http(s) 响应无法查 cookie，别因此丢掉整个响应
+        return []; // 查 cookie 失败不该连累整个响应
     }
 }
 
@@ -130,11 +150,16 @@ async function handle(sock, req, body) {
     let resp; // 拿到响应后才知道上游状态码
     let sent = 0; // 已推给 bridge 的字节数
     try {
-        const hasBody = body.length > 0 && req.method !== "GET" && req.method !== "HEAD";
+        await applyCookies(req.url, req.headers);
+
+        // fetch 会静默丢弃 forbidden header（Cookie、User-Agent 等），不用手动剥：
+        // Cookie 由 applyCookies 走 jar 带出去，UA 用 Chrome 自己的。
+        const headers = new Headers(req.headers);
+        headers.set("x-bridge-hop", "1"); // 回环检测标记
         resp = await fetch(req.url, {
             method: req.method,
-            headers: buildHeaders(req.headers),
-            body: hasBody ? body : undefined,
+            headers,
+            body: body.length && req.method !== "GET" && req.method !== "HEAD" ? body : undefined,
             credentials: "include", // 带上 Chrome 的 Cookie
             cache: "no-store",
             signal: ac.signal,
@@ -147,30 +172,39 @@ async function handle(sock, req, body) {
         // shortcut: 中间跳的 Set-Cookie 仍然丢，GET/HEAD 多一次往返；要补全得让 Chrome 别跟重定向，
         // 但 service worker 里 redirect:"manual" 只给 opaqueredirect（status 0、无 header），做不到。
         // 发不出去就退回正常路径，让下面的 drain() 按「连接已断」抛错，别假装成功
-        const replay = resp.redirected && resp.url !== req.url && (req.method === "GET" || req.method === "HEAD");
-        if (replay && send(sock, { t: "end", id: req.id, status: 302, headers: [["location", resp.url]] })) {
-            resp.body?.cancel().catch(() => { }); // 终点正文客户端会自己再取一遍，别白读
+        const replay =
+            resp.redirected &&
+            resp.url !== req.url &&
+            (req.method === "GET" || req.method === "HEAD");
+        if (
+            replay &&
+            send(sock, { t: "end", id: req.id, status: 302, headers: [["location", resp.url]] })
+        ) {
+            resp.body?.cancel().catch(() => {}); // 终点正文客户端会自己再取一遍，别白读
             return;
         }
 
-        // 只有 resp.body 是流式的；HEAD / 204 / 304 按规范就是 null，无需再判断状态码
-        if (resp.body) {
-            const reader = resp.body.getReader();
-            for (; ;) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                await drain(sock);
-                send(sock, { t: "data", id: req.id }, value);
-                sent += value.length;
-            }
+        // HEAD / 204 / 304 的 body 为 null；ReadableStream 原生支持异步迭代，无需手动管理 reader。
+        for await (const chunk of resp.body ?? []) {
+            await drain(sock);
+            send(sock, { t: "data", id: req.id }, chunk);
+            sent += chunk.length;
         }
-        send(sock, { t: "end", id: req.id, status: resp.status, headers: [...resp.headers, ...(await cookieHeaders(resp.url))] });
+        send(sock, {
+            t: "end",
+            id: req.id,
+            status: resp.status,
+            headers: [...resp.headers, ...(await cookieHeaders(resp.url))],
+        });
     } catch (e) {
         if (ac.signal.aborted) return; // 被 bridge 取消时不用回报
         // bridge 只认 end 帧，「上游已响应但正文断了」和「根本没连上」的区别只能靠这里拼进 msg
         send(sock, {
-            t: "end", id: req.id, status: 0, headers: [],
-            msg: resp ? `上游已回 ${resp.status}，已发 ${sent} 字节后失败（${e}）` : `fetch 失败：${e}`,
+            t: "end",
+            id: req.id,
+            msg: resp
+                ? `上游已回 ${resp.status}，已发 ${sent} 字节后失败（${e}）`
+                : `fetch 失败：${e}`,
         });
     } finally {
         inflight.delete(req.id);
