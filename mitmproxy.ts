@@ -1,13 +1,16 @@
 #!/usr/bin/env bun
 /**
- * chrome-bridge：本地代理（HTTP / HTTPS CONNECT / SOCKS5 共用一个端口），
+ * chrome-bridge：本地 HTTP(S)/SOCKS5 代理，
  * 除本地回环地址（直接转发）外，所有 HTTP(S) 请求都交给 Chrome 扩展用 fetch 发出。
  * 配合 background.js（协议 v5）使用。
  *
  *   ulimit -n 10240 && bun --prefer-offline mitmproxy.ts [--port 1080] [--ws 127.0.0.1:8765] [--ca-dir ~/.chrome-bridge-ca] [--passthrough "*.apple.cn,*.apple.com,*.icloud.com"]
  */
 import * as mockttp from "mockttp@4.6.5";
-import { findRawHeader, rawHeadersToObject } from "mockttp@4.6.5/dist/util/header-utils";
+import {
+    findRawHeader,
+    rawHeadersToObject,
+} from "mockttp@4.6.5/dist/util/header-utils";
 import { isLocalhostAddress } from "mockttp@4.6.5/dist/util/ip-utils";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -15,17 +18,20 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import type { ServerWebSocket } from "bun";
 
+// ================================================================ ① 配置
 const { values: options } = parseArgs({
     args: Bun.argv.slice(2),
     options: {
-        port: { type: "string", short: "p", default: "1080" },
         ws: { type: "string", default: "127.0.0.1:8765" },
-        "ca-dir": { type: "string", default: join(homedir(), ".chrome-bridge-ca") },
+        port: { type: "string", short: "p", default: "1080" },
         passthrough: { type: "string", default: "" },
+        "ca-dir": {
+            type: "string",
+            default: join(homedir(), ".chrome-bridge-ca"),
+        },
     },
 });
 
-const TIMEOUT_MS = 60_000;
 const port = Number(options.port);
 const wsUrl = new URL(`ws://${options.ws}`);
 const caDir = options["ca-dir"];
@@ -34,6 +40,7 @@ const passthrough = options.passthrough
     .map((s) => s.trim())
     .filter(Boolean);
 
+// ================================================================ ② 通信协议
 type ToExt =
     | {
           t: "req";
@@ -49,6 +56,15 @@ type FromExt =
     | { t: "end"; id: string; status: number; headers: [string, string][] }
     | { t: "end"; id: string; msg: string }; // 扩展侧失败，文案由扩展拼好
 
+type Reply = mockttp.requestSteps.CallbackResponseMessageResult;
+type WS = ServerWebSocket<undefined>;
+
+interface Pending {
+    method: string;
+    chunks: Buffer[];
+    resolve: (reply: Reply) => void;
+}
+
 function pack(head: ToExt, body?: Uint8Array): Buffer {
     const h = Buffer.from(`${JSON.stringify(head)}\n`);
     return body?.length ? Buffer.concat([h, body]) : h;
@@ -62,18 +78,7 @@ function unpack(b: Buffer): { head: FromExt; body: Buffer } {
     };
 }
 
-type Reply = mockttp.requestSteps.CallbackResponseMessageResult;
-type WS = ServerWebSocket<undefined>;
-
-interface Pending {
-    id: string;
-    method: string;
-    chunks: Buffer[];
-    size: number;
-    seen: number;
-    resolve: (reply: Reply) => void;
-}
-
+// ================================================================ ③ 扩展通道
 let current: WS | undefined;
 const pending = new Map<string, Pending>();
 
@@ -93,29 +98,22 @@ function send(head: ToExt, body?: Uint8Array) {
     current?.send(pack(head, body));
 }
 
-function finish(p: Pending, reply: Reply) {
-    pending.delete(p.id);
-    p.resolve(reply);
+function finish(id: string, reply: Reply) {
+    pending.get(id)?.resolve(reply);
+    pending.delete(id);
 }
 
 function fail(id: string, why: string, code: number) {
-    const p = pending.get(id);
-    if (!p) return;
+    if (!pending.has(id)) return;
     send({ t: "cancel", id });
-    finish(p, textReply(code, why));
+    finish(id, textReply(code, why));
 }
 
 function failAll(why: string, code: number) {
     for (const id of pending.keys()) fail(id, why, code);
 }
 
-setInterval(() => {
-    const now = Date.now();
-    for (const p of pending.values()) {
-        if (now - p.seen > TIMEOUT_MS) fail(p.id, "扩展响应超时", 504);
-    }
-}, 1000);
-
+// ================================================================ ④ HTTP 转发
 const HOP_BY_HOP = new Set([
     "connection",
     "keep-alive",
@@ -125,87 +123,79 @@ const HOP_BY_HOP = new Set([
     "upgrade",
 ]);
 
-function forwardable(raw: [string, string][]): [string, string][] {
-    const drop = new Set(HOP_BY_HOP);
-    for (const [k, v] of raw)
-        if (k.toLowerCase() === "connection")
-            for (const n of v.split(",")) drop.add(n.trim().toLowerCase());
-    return raw.filter(([k]) => {
-        const n = k.toLowerCase();
-        return (
-            !drop.has(n) &&
-            !n.startsWith("proxy-") &&
-            !n.startsWith("x-bridge-") &&
-            !n.startsWith(":")
-        );
+const NO_BODY_STATUS = new Set([204, 205, 304]);
+
+function forwardable(headers: [string, string][]): [string, string][] {
+    const excluded = new Set(HOP_BY_HOP);
+    for (const [name, value] of headers)
+        if (name.toLowerCase() === "connection")
+            for (const header of value.split(","))
+                excluded.add(header.trim().toLowerCase());
+    return headers.filter(([name]) => {
+        const lowerName = name.toLowerCase();
+        return !excluded.has(lowerName) && !lowerName.startsWith("proxy-");
     });
 }
 
-const NO_BODY_STATUS = new Set([204, 205, 304]);
-
-function complete(p: Pending, status: number, pairs: [string, string][]) {
-    const out = forwardable(pairs).filter(([k]) => {
-        const n = k.toLowerCase();
-        return n !== "content-length" && n !== "content-encoding";
+function complete(
+    id: string,
+    pendingRequest: Pending,
+    status: number,
+    pairs: [string, string][],
+) {
+    const headers = forwardable(pairs).filter(([name]) => {
+        const lowerName = name.toLowerCase();
+        return (
+            lowerName !== "content-length" && lowerName !== "content-encoding"
+        );
     });
+    const rawBody = Buffer.concat(pendingRequest.chunks);
 
     // mockttp 会删除默认 framing 头，必须显式写回 content-length。
     if (!NO_BODY_STATUS.has(status)) {
         const length =
-            p.method === "HEAD" ? findRawHeader(pairs, "content-length")?.[1] : String(p.size);
-        if (length) out.push(["content-length", length]);
+            pendingRequest.method === "HEAD"
+                ? findRawHeader(pairs, "content-length")?.[1]
+                : String(rawBody.length);
+        if (length) headers.push(["content-length", length]);
     }
 
-    const rawBody = p.chunks.length === 1 ? p.chunks[0] : Buffer.concat(p.chunks, p.size);
-
-    finish(p, {
+    finish(id, {
         statusCode: status,
-        headers: rawHeadersToObject(out),
+        headers: rawHeadersToObject(headers),
         rawBody,
     });
 }
 
 function onFrame(head: FromExt, body: Buffer) {
-    const p = pending.get(head.id);
-    if (!p) return;
+    const pendingRequest = pending.get(head.id);
+    if (!pendingRequest) return;
 
-    if (head.t === "end") {
-        return "msg" in head
-            ? finish(p, textReply(502, head.msg))
-            : complete(p, head.status, head.headers);
-    }
-
-    p.size += body.length;
-    p.chunks.push(body);
-    p.seen = Date.now();
+    if (head.t === "data") pendingRequest.chunks.push(body);
+    else if ("msg" in head) finish(head.id, textReply(502, head.msg));
+    else complete(head.id, pendingRequest, head.status, head.headers);
 }
 
 function viaChrome(req: mockttp.CompletedRequest): mockttp.MaybePromise<Reply> {
-    if (current?.readyState !== WebSocket.OPEN) return textReply(502, "Chrome 扩展未连接");
-
-    const body = req.body.buffer;
+    if (current?.readyState !== WebSocket.OPEN)
+        return textReply(502, "Chrome 扩展未连接");
 
     return new Promise<Reply>((resolve) => {
-        const p: Pending = {
-            id: req.id,
-            method: req.method,
-            chunks: [],
-            size: 0,
-            seen: Date.now(),
-            resolve,
-        };
-        pending.set(req.id, p);
-        const head: ToExt = {
-            t: "req",
-            id: req.id,
-            method: req.method,
-            url: req.url,
-            headers: forwardable(req.rawHeaders),
-        };
-        send(head, body);
+        pending.set(req.id, { method: req.method, chunks: [], resolve });
+        send(
+            {
+                t: "req",
+                id: req.id,
+                method: req.method,
+                url: req.url,
+                headers: forwardable(req.rawHeaders),
+            },
+            req.body.buffer,
+        );
     });
 }
 
+// ================================================================ ⑤ 服务与接线
 const wsServer = Bun.serve({
     hostname: wsUrl.hostname,
     port: Number(wsUrl.port),
@@ -215,23 +205,16 @@ const wsServer = Bun.serve({
     },
     websocket: {
         maxPayloadLength: 2 ** 31 - 1,
-        perMessageDeflate: false,
-        idleTimeout: 120,
         open(ws: WS) {
-            if (current) {
-                failAll("扩展连接被替换", 502);
-                current.close(1000, "replaced");
-            }
             current = ws;
             console.log("[ws]    Chrome 扩展已连接");
         },
-        message(ws: WS, message: string | Buffer) {
-            if (ws !== current || typeof message === "string") return;
+        message(_, message: string | Buffer) {
+            if (typeof message === "string") return;
             const frame = unpack(message);
             onFrame(frame.head, frame.body);
         },
-        close(ws: WS) {
-            if (ws !== current) return;
+        close() {
             current = undefined;
             console.log("[ws]    Chrome 扩展已断开");
             failAll("Chrome 扩展已断开", 502);
@@ -239,6 +222,7 @@ const wsServer = Bun.serve({
     },
 });
 
+// ================================================================ ⑥ CA 与代理
 async function ensureCA(dir: string) {
     const keyPath = join(dir, "ca.key");
     const certPath = join(dir, "ca.pem");
@@ -275,7 +259,7 @@ const server = mockttp.getLocal({
 await server.forAnyWebSocket().thenPassThrough();
 await server
     .forAnyRequest()
-    .matching((req) => !!isLocalhostAddress(req.destination.hostname))
+    .matching((req) => isLocalhostAddress(req.destination.hostname))
     .always()
     .thenPassThrough();
 await server.forUnmatchedRequest().thenCallback(viaChrome);
@@ -290,11 +274,11 @@ console.log(
 console.log(`[ws]    等待扩展连接 ws://${wsUrl.hostname}:${wsServer.port}`);
 console.log(`[ca]    ${certPath}`);
 
+// ================================================================ ⑦ 退出
 async function shutdown() {
     failAll("bridge 正在关闭", 503);
     await server.stop();
-    wsServer.stop(true);
-    process.exit();
+    await wsServer.stop(true);
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
