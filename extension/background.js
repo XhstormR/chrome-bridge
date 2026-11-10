@@ -69,7 +69,8 @@ chrome.alarms.onAlarm.addListener(connect);
 connect();
 
 async function applyCookies(url, headers) {
-    const secure = new URL(url).protocol === "https:";
+    if (new URL(url).origin !== "https://mirrors.ustc.edu.cn") return;
+
     for (const cookie of headers.get("cookie")?.split(";") ?? []) {
         const i = cookie.indexOf("=");
         await chrome.cookies.set({
@@ -77,7 +78,7 @@ async function applyCookies(url, headers) {
             name: cookie.slice(0, i).trim(),
             value: cookie.slice(i + 1).trim(),
             path: "/",
-            secure,
+            secure: true,
         });
     }
 }
